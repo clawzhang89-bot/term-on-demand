@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# log-view - 生成日志查看器 HTML
+# 用法: log-view /var/log/nginx/access.log [行数]
+# 输出: /var/www/html/log-{basename}.html
+
+set -euo pipefail
+
+NGINX_ROOT="${NGINX_ROOT:-/var/www/html}"
+LOG_FILE="${1:-}"
+LINES="${2:-500}"
+
+if [ -z "$LOG_FILE" ] || [ ! -f "$LOG_FILE" ]; then
+  echo "用法: log-view <日志文件> [行数]"
+  echo "示例: log-view /var/log/nginx/access.log 200"
+  exit 1
+fi
+
+LOG_BASENAME=$(basename "$LOG_FILE")
+OUTPUT="${NGINX_ROOT}/log-${LOG_BASENAME}.html"
+FILESIZE=$(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+FILEMOD=$(stat -f%Sm -t '%Y-%m-%d %H:%M:%S' "$LOG_FILE" 2>/dev/null || stat -c '%y' "$LOG_FILE" 2>/dev/null | cut -d. -f1 || echo "-")
+
+# 收集统计
+ERROR_COUNT=$(grep -ciE 'error|fail|exception|500|502|503' "$LOG_FILE" 2>/dev/null || echo 0)
+TOTAL_LINES=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
+
+# 取最后 N 行
+tail_lines=$(tail -n "$LINES" "$LOG_FILE" 2>/dev/null || echo "")
+
+cat > "$OUTPUT" << EOF
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=1080">
+<title>📋 ${LOG_BASENAME}</title>
+<style>
+  body {
+    background: #1a1a2e;
+    color: #e0e0e0;
+    font-family: 'SF Mono', 'Cascadia Code', monospace;
+    font-size: 14px;
+    padding: 1.5rem;
+    margin: 0;
+  }
+  h1 { color: #00d4aa; font-size: 1.3rem; }
+  .stats { display: flex; gap: 1.5rem; margin: 1rem 0; padding: 1rem; background: #16213e; border-radius: 8px; }
+  .stat-item { text-align: center; }
+  .stat-value { font-size: 1.5rem; font-weight: bold; color: #e94560; }
+  .stat-label { font-size: 0.8rem; color: #888; }
+  #search { width: 100%; padding: 0.5rem; background: #16213e; border: 1px solid #0f3460; color: #e0e0e0; border-radius: 6px; font-size: 1rem; margin-bottom: 0.5rem; }
+  pre { background: #0d1117; padding: 1rem; border-radius: 8px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; font-size: 0.9rem; line-height: 1.5; margin: 0; }
+  .line-error { background: rgba(233,69,96,0.15); }
+  .line-warn { background: rgba(255,193,7,0.1); }
+  .meta { color: #555; font-size: 0.8rem; margin-top: 1rem; }
+</style>
+<script>
+function filterLog() {
+  const q = document.getElementById('search').value.toLowerCase();
+  document.querySelectorAll('pre code .line').forEach(l => {
+    l.style.display = l.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
+}
+</script>
+</head>
+<body>
+  <h1>📋 ${LOG_BASENAME}</h1>
+  <div class="stats">
+    <div class="stat-item"><div class="stat-value">${TOTAL_LINES}</div><div class="stat-label">总行数</div></div>
+    <div class="stat-item"><div class="stat-value">${ERROR_COUNT}</div><div class="stat-label">错误/异常</div></div>
+    <div class="stat-item"><div class="stat-value">$(( $(echo "$FILESIZE" | awk '{print $1}') / 1024 ))KB</div><div class="stat-label">文件大小</div></div>
+    <div class="stat-item"><div class="stat-value">${LINES}</div><div class="stat-label">显示行数</div></div>
+  </div>
+  <input id="search" placeholder="搜索日志..." oninput="filterLog()">
+  <pre><code>
+EOF
+
+# 写入日志内容，标记错误行
+echo "$tail_lines" | while IFS= read -r line; do
+  safe_line=$(echo "$line" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+  if echo "$line" | grep -qiE 'error|exception|500|502|503|fatal'; then
+    echo "<span class=\"line line-error\">${safe_line}</span>" >> "$OUTPUT"
+  elif echo "$line" | grep -qiE 'warn|timeout'; then
+    echo "<span class=\"line line-warn\">${safe_line}</span>" >> "$OUTPUT"
+  else
+    echo "<span class=\"line\">${safe_line}</span>" >> "$OUTPUT"
+  fi
+done
+
+cat >> "$OUTPUT" << EOF
+  </code></pre>
+  <div class="meta">文件: ${LOG_FILE} | 修改时间: ${FILEMOD}</div>
+</body>
+</html>
+EOF
+
+echo "✅ log-${LOG_BASENAME}.html generated → http://your-server/log-${LOG_BASENAME}.html"

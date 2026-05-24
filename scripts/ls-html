@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# ls-html - 生成目录文件浏览器 HTML
+# 用法: ls-html /path/to/dir
+# 输出: /var/www/html/dir-{basename}.html
+
+set -euo pipefail
+
+NGINX_ROOT="${NGINX_ROOT:-/var/www/html}"
+TARGET_DIR="${1:-.}"
+DIR_NAME=$(basename "$(realpath "$TARGET_DIR")")
+OUTPUT="${NGINX_ROOT}/dir-${DIR_NAME}.html"
+
+# 收集文件信息
+entries=$(mktemp)
+find "$TARGET_DIR" -maxdepth 2 -type f -o -type d | while read -r item; do
+  rel="${item#$TARGET_DIR}"
+  if [ -d "$item" ]; then
+    size=$(find "$item" -maxdepth 0 -type d 2>/dev/null | xargs -I{} du -sh {} 2>/dev/null | cut -f1)
+    echo "DIR|$rel|$size|" >> "$entries"
+  else
+    size=$(stat -f%z "$item" 2>/dev/null || stat -c%s "$item" 2>/dev/null || echo "0")
+    mtime=$(stat -f%Sm -t '%Y-%m-%d %H:%M' "$item" 2>/dev/null || stat -c '%y' "$item" 2>/dev/null | cut -d. -f1 || echo "-")
+    if [[ "$rel" == *.md ]]; then ext="md"; elif [[ "$rel" == *.py ]]; then ext="py";
+    elif [[ "$rel" == *.sh ]]; then ext="sh"; elif [[ "$rel" == *.go ]]; then ext="go";
+    elif [[ "$rel" == *.js ]]; then ext="js"; elif [[ "$rel" == *.json ]]; then ext="json";
+    elif [[ "$rel" == *.yaml || "$rel" == *.yml ]]; then ext="yaml";
+    elif [[ "$rel" == *.log ]]; then ext="log"; else ext="file"; fi
+    echo "FILE|$rel|$size|$mtime|$ext" >> "$entries"
+  fi
+done
+
+# 生成 HTML
+cat > "$OUTPUT" <<'HTMLHEAD'
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=1080">
+HTMLHEAD
+echo "<title>📁 ${DIR_NAME}</title>" >> "$OUTPUT"
+cat >> "$OUTPUT" <<'HTMLSTYLE'
+<style>
+  body {
+    background: #1a1a2e;
+    color: #e0e0e0;
+    font-family: 'SF Mono', 'Cascadia Code', monospace;
+    font-size: 16px;
+    padding: 1.5rem;
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+  h1 { color: #00d4aa; font-size: 1.5rem; border-bottom: 1px solid #333; padding-bottom: 0.5rem; }
+  table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+  th { text-align: left; color: #888; font-weight: normal; font-size: 0.85rem; padding: 0.5rem; border-bottom: 1px solid #333; cursor: pointer; }
+  td { padding: 0.4rem 0.5rem; border-bottom: 1px solid #222; font-size: 0.95rem; }
+  tr:hover { background: #16213e; }
+  .dir { color: #00d4aa; }
+  .file { color: #e0e0e0; }
+  .size { color: #888; text-align: right; font-variant-numeric: tabular-nums; }
+  .time { color: #555; }
+  .ext-badge { display: inline-block; background: #0f3460; color: #888; padding: 0 0.3rem; border-radius: 3px; font-size: 0.8rem; }
+  #search { width: 100%; padding: 0.6rem; background: #16213e; border: 1px solid #0f3460; color: #e0e0e0; border-radius: 6px; font-size: 1rem; margin-bottom: 0.5rem; }
+</style>
+<script>
+function filterTable() {
+  const q = document.getElementById('search').value.toLowerCase();
+  document.querySelectorAll('tbody tr').forEach(r => {
+    r.style.display = r.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
+}
+</script>
+</head>
+<body>
+  <h1>📁 ${DIR_NAME}</h1>
+  <input id="search" placeholder="搜索文件..." oninput="filterTable()">
+  <table>
+    <thead><tr><th>名称</th><th>大小</th><th>修改时间</th><th>类型</th></tr></thead>
+    <tbody>
+HTMLSTYLE
+
+while IFS='|' read -r type rel size mtime ext; do
+  [ -z "$rel" ] && continue
+  safe_rel=$(echo "$rel" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+  if [ "$type" = "DIR" ]; then
+    echo "      <tr><td class=\"dir\">📁 ${safe_rel}</td><td class=\"size\">${size}</td><td class=\"time\">-</td><td><span class=\"ext-badge\">dir</span></td></tr>" >> "$OUTPUT"
+  else
+    echo "      <tr><td class=\"file\">📄 ${safe_rel}</td><td class=\"size\">${size}</td><td class=\"time\">${mtime}</td><td><span class=\"ext-badge\">${ext}</span></td></tr>" >> "$OUTPUT"
+  fi
+done < "$entries"
+
+rm "$entries"
+
+cat >> "$OUTPUT" <<'HTMLEND'
+    </tbody>
+  </table>
+</body>
+</html>
+HTMLEND
+
+echo "✅ dir-${DIR_NAME}.html generated → http://your-server/dir-${DIR_NAME}.html"

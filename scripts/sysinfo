@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# sysinfo - 生成系统状态仪表盘 HTML
+# 用法: sysinfo
+# 输出: /var/www/html/sysinfo.html
+
+set -euo pipefail
+
+NGINX_ROOT="${NGINX_ROOT:-/var/www/html}"
+OUTPUT="${NGINX_ROOT}/sysinfo.html"
+HOSTNAME=$(hostname)
+DATE=$(date '+%Y-%m-%d %H:%M:%S')
+
+# 采集系统信息
+CPU_LOAD=$(uptime | awk -F'load average:' '{print $2}')
+MEM_TOTAL=$(free -h | awk '/^Mem:/{print $2}')
+MEM_USED=$(free -h | awk '/^Mem:/{print $3}')
+MEM_PCT=$(free | awk '/^Mem:/{printf "%.1f", $3/$2 * 100}')
+DISK_INFO=$(df -h / | awk 'NR==2{print $3 " / " $2 " (" $5 ")"}')
+
+cat > "$OUTPUT" << EOF
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=1080">
+<title>系统状态 - ${HOSTNAME}</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  body {
+    background: #1a1a2e;
+    color: #e0e0e0;
+    font-family: 'SF Mono', 'Cascadia Code', monospace;
+    font-size: 18px;
+    padding: 2rem;
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+  h1 { color: #00d4aa; font-size: 2rem; border-bottom: 1px solid #333; padding-bottom: 0.5rem; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-top: 1.5rem; }
+  .card { background: #16213e; border-radius: 12px; padding: 1.5rem; border: 1px solid #0f3460; }
+  .card h2 { color: #00d4aa; font-size: 1.2rem; margin-top: 0; }
+  .value { font-size: 1.8rem; font-weight: bold; color: #e94560; }
+  .label { color: #888; font-size: 0.9rem; }
+  .update-time { color: #555; font-size: 0.8rem; text-align: right; margin-top: 2rem; }
+</style>
+</head>
+<body>
+  <h1>🖥 ${HOSTNAME}</h1>
+  <div class="grid">
+    <div class="card">
+      <h2>CPU 负载</h2>
+      <div class="value">${CPU_LOAD}</div>
+    </div>
+    <div class="card">
+      <h2>内存</h2>
+      <div class="value">${MEM_USED} / ${MEM_TOTAL}</div>
+      <div class="label">已使用 ${MEM_PCT}%</div>
+    </div>
+    <div class="card">
+      <h2>磁盘 (/)</h2>
+      <div class="value">${DISK_INFO}</div>
+    </div>
+    <div class="card">
+      <h2>运行时间</h2>
+      <div class="value">$(uptime -p 2>/dev/null || uptime)</div>
+    </div>
+  </div>
+  <div class="update-time">生成时间: ${DATE}</div>
+</body>
+</html>
+EOF
+
+echo "✅ sysinfo.html generated → file://${OUTPUT}"
+echo "   http://your-server/sysinfo.html"
