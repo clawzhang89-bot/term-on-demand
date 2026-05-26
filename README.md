@@ -153,6 +153,51 @@ log-view /var/log/nginx/access.log 200
   → 看完关掉 tab，回到终端
 ```
 
+### 语音直接下命令
+
+```
+按下中文语音键 → "看一下最近10个pod的状态"
+  → 语音上传 → ASR → LLM 翻译 → 注入 tmux
+  → terminal 出现: kubectl get pods --sort-by=.status.startTime | tail -10
+  → 你确认/修改后回车执行
+```
+
+---
+
+## 🎤 语音交互执行
+
+### 核心理念
+
+语音不是键盘替代，是**意图通道**。按键完成精确操作（Ctrl+C、Tab补全、翻页），语音完成内容输入（说路径、描述需求）。
+
+### 双端架构
+
+```
+┌─ Beam Pro ─────────────────────┐    ┌─ 云端 Ubuntu ──────────────────┐
+│  [Voice/Key Daemon]            │    │  [Voice Gateway]               │
+│  (Android Foreground Service)  │    │  (Python FastAPI + WebSocket)  │
+│   ├─ 蓝牙HID按键监听           │    │   ├─ ASR (faster-whisper / API)│
+│   ├─ PTT录音 + 流式上传 ──WSS──┼────┼→  ├─ LLM 意图→命令翻译         │
+│   ├─ 接收候选 ←───────────WSS──┼────┼── │  ├─ tmux send-keys 注入     │
+│   └─ overlay 候选UI显示       │    │   └─ 会话状态管理              │
+│  [SSH client]──SSH→ tmux session  │  └──────────────────────────────┘
+└─────────────────────────────────┘
+```
+
+### 核心决策
+
+| 决策 | 选型 | 理由 |
+|------|------|------|
+| 命令注入 | **`tmux send-keys`** | 一行 shell 搞定，不需 Android Accessibility，零改造现有工作流 |
+| 语音→命令 | **LLM 作为意图翻译层** | 语音不试图输出字符级精确字符串（路径/符号），交给 LLM 理解意图转 shell 命令 |
+| 语种切换 | **硬件键硬切换** | 中英混识别是 ASR 最大坑点，物理键偏置是最可靠解法 |
+| 部署阶段 | **先全云端，后加本地 ASR** | MVP 复杂度最低，Phase 3 再加本地兜底走隐私/断网路径 |
+| 降级策略 | **失败时退到纯键盘** | 任何组件挂了，Termius + tmux 照常工作 |
+
+> 完整文档 →  [`docs/06-voice-interaction-execution.md`](docs/06-voice-interaction-execution.md)
+> 包含：完整架构图、WebSocket 接口定义、交互时间线（T+0 到 T+5s）、6 项关键技术决策选型、三场景延迟预算表、失败模式清单、4 阶段实施路线（Phase 0 可行性验证 → Phase 4 本地 ASR + 流式）、11 条未解决问题。
+> 对应讨论 →  [Issue #4](https://github.com/clawzhang89-bot/term-on-demand/issues/4)
+
 ### 需要 AI agent 代操作时
 
 ```
@@ -177,6 +222,7 @@ log-view /var/log/nginx/access.log 200
 | [🤖 AI Prompt 示例](ai/prompt-samples.md) | 让 AI 写 HTML 的 prompt 模板 |
 | [📜 预制脚本说明](scripts/README.md) | 内置脚本的使用方式 |
 | [🗺 路线图](docs/05-roadmap.md) | 待办和未来方向 |
+| [🎤 语音交互执行](docs/06-voice-interaction-execution.md) | 语音→命令→终端执行完整蓝图（Phase 0-4） |
 
 ---
 
