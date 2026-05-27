@@ -39,9 +39,131 @@
 - Ctrl + 确认 = Ctrl+C（中断）
 - Ctrl + Tab = Ctrl+D（退出/EOF）
 
+## 架构方案对比
+
+8BitDo 注册为蓝牙键盘后，按键事件直接走 **Android Input Framework → App**，不需要任何软件介入。
+
+核心问题在于**语音输出的文字应该通过什么渠道送进 App**。
+
+以下三种方案的区别在于语音→文字的注入层。
+
+---
+
+### 方案一：IME 注入（不推荐）
+
+**核心思路：** 把语音输出做成一个 Android IME（`InputMethodService`），通过 IME 向当前焦点编辑器提交文字。
+
+**架构图：**
+
+```
+8BitDo Micro                    Voice IME (InputMethodService)
+  │                                   │
+  │  HID key events                   │  STT → InputConnection.commitText()
+  ▼                                   ▼
+Android Input Framework        Android InputMethodManager
+  │                                   │
+  │  直接送到 App                     │  仅向焦点文本框提交
+  ▼                                   ▼
+Termius / 浏览器                当前焦点编辑框
+```
+
+**优点：**
+- Android 原生机制，无需 AccessibilityService 权限
+- 文字提交是系统级 API，稳定性高
+
+**缺点：**
+- IME 只能向**焦点文本框**提交文字 —— 终端 App 的核心交互区（虚拟终端）通常不是标准 EditText 控件
+- IME 必须接管系统键盘。8BitDo 已是物理键盘，但 IME 无法选择"只处理语音、不管键盘"。两者职责冲突
+- 焦点一移，语音输出中断或丢失
+- 不适合终端场景，适合聊天/笔记类 App
+
+**结论：不推荐。** 这不是技术难点问题，是**层的错配**——终端场景的"目标"不是一个文本框，而是虚拟终端 buffer。IME 无法也不应该处理这个。
+
+---
+
+### 方案二：AccessibilityService 注入（推荐）
+
+**核心思路：** 不碰 IME。Voice/Key Daemon 跑 Foreground Service 做 STT + 命令路由，文本注入走 `AccessibilityService`。
+
+**架构图：**
+
+```
+8BitDo Micro                    Voice/Key Daemon (Foreground Service)
+  │                                   │
+  │  HID key events                   │  BLE / Beam Pro mic → STT → 解析
+  ▼                                   ▼
+Android Input Framework        意图解析器（Route Engine）
+  │                                 │           │
+  │  直接送到 App                     │            │
+  ▼                                   ▼           ▼
+Termius / 浏览器             AccessibilityService   Intent
+                            (文本注入: setText     (系统命令:
+                             / performGlobalAction)  startActivity)
+```
+
+**优点：**
+- AccessibilityService 可以操作任何 UI 元素，不限于文本框
+- 8BitDo 独立走 HID，不与 Daemon 交互，零耦合
+- 可以同时处理"文本注入"(语音内容)和"系统命令"(打开终端、切换 App)
+- Foreground Service 长期存活，不依赖焦点
+
+**缺点：**
+- 需要声明 `BIND_ACCESSIBILITY_SERVICE` 权限
+- 部分 App 的 WebView/自定义控件可能不支持 AccessibilityNodeInfo
+- 注入长文本时不如 IME 的 commitText 流畅
+
+**适用场景：** 终端操作（输入路径、执行命令、粘贴代码片段）、语音控制 App 切换。
+
+---
+
+### 方案三：渐进上手路径（最实用）
+
+**核心思路：** 不一步到位。先跑起来，再逐步取代。
+
+**架构图：**
+
+```
+              ┌─────────────────────────────────────────┐
+Phase 0       │  8BitDo Micro          Gboard （语音输入）│
+              │  + Termius 工具栏    （Android 自带语音）  │
+              │  零开发，验证核心交互                      │
+              └─────────────────────────────────────────┘
+                                   │
+                                   ▼ 发现 Gboard 不够好
+              ┌─────────────────────────────────────────┐
+Phase 1       │  8BitDo Micro          轻量 Voice Daemon │
+              │                        (STT + 剪贴板输出) │
+              │  （剪贴板辅助工具自动粘贴）                 │
+              └─────────────────────────────────────────┘
+                                   │
+                                   ▼ 发现剪贴板不够流畅
+              ┌─────────────────────────────────────────┐
+Phase 2       │  8BitDo Micro         完整 Voice/Key     │
+              │                        Daemon +           │
+              │                        AccessibilityService│
+              └─────────────────────────────────────────┘
+```
+
+**Phase 0 — 零开发验证期**
+- 8BitDo Micro 到手配好键位映射
+- 语音用 Gboard 自带语音输入
+- Termius 上方 command bar 补充常用快捷键
+- 目标：先感受"物理键 + 语音"的工作流是否真的舒服
+
+**Phase 1 — 轻量 Voice Daemon**
+- 写一个简版 Foreground Service 跑 STT
+- 语音转文字后写入系统剪贴板
+- 配合剪贴板同步工具（或手动按粘贴键）补上注入环节
+- 开始积累实际使用数据和路由规则
+
+**Phase 2 — 完整 AccessibilityService 版本**
+- 在 Phase 1 的基础上升级 Daemon + AccessibilityService
+- 文本注入从"剪贴板+手动粘贴"升级为 AccessibilityService 自动注入
+- 加入系统命令路由（"打开浏览器"→startActivity）
+
 ## 实现方式
 
-### 方案一：8BitDo Micro — 推荐物理方案
+### 硬件方案一：8BitDo Micro — 推荐物理按键
 
 **目前最适合 AR 终端场景的实体按键选择：**
 
@@ -67,13 +189,13 @@
 
 **价格：** ¥180 左右，性价比极高。
 
-### 方案二：Android 虚拟 Macropad（零额外硬件）
+### 硬件方案二：Android 虚拟 Macropad（零额外硬件）
 
 Beam Pro 自带触屏，完全可以不买实体按键。做法是在 Beam Pro 上跑一个**浮动悬浮窗**（`SYSTEM_ALERT_WINDOW` overlay），触摸按钮通过 AccessibilityService 注入键盘事件。
 
 **实现途径：**
 
-| 方案 | 需写代码？ | 特点 |
+| 方式 | 需写代码？ | 特点 |
 |------|-----------|------|
 | **自写 Android 悬浮窗 APK** | ✅ 是 | 最可控、与 [Voice/Key Daemon](06-voice-interaction-execution.md) 同一套代码、推荐 |
 | **Tasker + AutoInput** | ❌ 配 | 能实现，但配置量不亚于写代码 |
@@ -83,28 +205,13 @@ Beam Pro 自带触屏，完全可以不买实体按键。做法是在 Beam Pro �
 
 自写一个最简单悬浮窗 APK 大约 **半天工作量**，并且可以和 Voice/Key Daemon 合并，一个 APK 搞定按键 + 语音输入。
 
-### 方案三：混合策略（推荐的上手路线）
-
-**Phase 0（先跑起来 — 零成本）：**
-- Beam Pro 上 Termius 自带 command bar + 触屏操作
-- 最常用操作固定在屏幕上方的工具栏（Ctrl+C/V/Tab/Esc/方向键）
-- 语音部分用 Voice Gateway 的 MVP 版本
-- **零额外成本，零硬件**，跑通核心交互后再决定是否添置实体按键
-
-**Phase 1（优化 — 添置 8BitDo Micro）：**
-- 添加实体按键覆盖精确操作（Enter/Esc/Tab/Ctrl 组合/方向）
-- 和 Voice/Key Daemon 并行走 WSS 到 Voice Gateway
-- 物理按键管精确操作，语音管内容输入，分工明确
-
-**Phase 2（深度整合）：**
-- 自写 Android 悬浮窗 APK，合并虚拟 macropad + Voice/Key Daemon
-- 或根据 Phase 0-1 的真实使用反馈决定最终形态
-
-### 方案四：TourBox Elite（一体机备选）
+### 硬件方案三：TourBox Elite（备选）
 
 8 按键 + 旋钮 + 触控环，滚轮+按键手感好。但 ¥1000+ 的价格对纯终端场景功能冗余，仅在已有 TourBox 的情况下可复用。
 
 ### 为什么不推荐更大键盘？
+
+AR 眼镜下需要**盲操**。6 个键摸两下就知道位置，全尺寸键盘需要定位、看着按，违背了"不跟终端抢键盘"的便携初衷。
 
 AR 眼镜下需要**盲操**。6 个键摸两下就知道位置，全尺寸键盘需要定位、看着按，违背了"不跟终端抢键盘"的便携初衷。
 
