@@ -11,6 +11,35 @@
 
 ---
 
+## 0.5 与 docs/03 的边界关系(重要)
+
+本文(06)与 [`docs/03-input.md`](03-input.md) 讨论的是**同一个交互问题在两个不同场景下的两条路径**,不是替代关系,也不是版本演进关系。读这两份文档时请先看清各自的覆盖范围:
+
+| 维度 | docs/06(本文) | docs/03 |
+|---|---|---|
+| **目标场景** | SSH + tmux 的远程终端开发(本项目的核心场景) | 非 tmux 通用 App 输入(浏览器地址栏、聊天 App、其他 Android App)|
+| **文本"注入"发生在哪** | **云端**(`tmux send-keys` 直接进 SSH session) | **Beam Pro 端**(IME / AccessibilityService 注入到当前焦点 App) |
+| **Beam Pro 端是否需要处理文本注入** | **不需要**(只负责按键事件捕获 + 麦克风 + 候选 overlay) | **需要**(IME 注入到 EditText / AccessibilityService 注入到 UI 节点) |
+| **能否承载"意图 → LLM 翻译 → shell 命令"** | 是(核心路径) | 否(03 的方案是字面文本注入,不经过 LLM 翻译) |
+| **是否需要 Android Accessibility 权限** | 否 | 是(03 的方案二)|
+
+### 为什么 06 不走 IME / AccessibilityService 路径
+
+在 SSH + tmux 场景下,**Beam Pro 上的 SSH client 不是"被注入文本"的目标**,而是"被动接收 tmux 推过来的字节流"的显示器。云端 `tmux send-keys -t dev "命令"` 等价于"有人在隔壁帮你打字",Termius/Termux 那边的 terminal 流里自然出现这一行,完全绕开了 docs/03 讨论的"语音输出的文字应该通过什么渠道送进 App"这个问题。
+
+也就是说:**docs/03 的"三大方案对比"在 SSH+tmux 场景下整段不进入决策空间**;那个对比是为了解决非 tmux 通用 App 输入场景而存在的。
+
+### 两份文档怎么共存
+
+- 如果你 100% 都在 SSH+tmux 里工作:按 06 实施即可,03 的 IME/AccessibilityService 讨论不需要落地
+- 如果你也有"在 Beam Pro 浏览器地址栏说话输入网址"这种需求:那部分按 03 实施(IME 或 AccessibilityService),与 06 在同一个 Voice/Key Daemon 进程里共存即可 — 按键事件捕获、PTT 录音、ASR 三个组件可以复用,只是输出去向(tmux send-keys vs 本地 IME/Accessibility)按当前 App 路由
+
+### 如果将来 03 的范围调整
+
+如果 docs/03 后续调整为也覆盖 tmux 场景(比如选了某种本地注入路径与 06 直接竞争),那两份文档需要做一次合并 review,确定 single source of truth。目前(2026-05)按上表的分工读即可。
+
+---
+
 ## 1. 设计原则
 
 1. **terminal 主路径不动** — SSH + tmux,语音是 augmentation,不是替代
@@ -18,6 +47,7 @@
 3. **双端架构** — Beam Pro 端负责事件捕获和 UI,云端负责 ASR/LLM/注入;不同关注点分离
 4. **优雅降级** — 网络断、ASR 崩、LLM 错,任何时刻能退回纯键盘继续工作
 5. **不依赖 root / 越狱** — 所有组件用标准 Android 权限和云端 user shell 权限
+6. **场景边界明确**:本设计假设 SSH + tmux 场景;非 tmux 通用 App 输入的方案见 [`docs/03-input.md`](03-input.md) 的 IME/AccessibilityService 讨论(详见 §0.5)
 
 ---
 
@@ -451,9 +481,10 @@ gateway/
 
 ### 建议修改(单独 PR,不在本 PR 内)
 
-- `docs/03-input.md` 末尾加一节"执行实现见 06"
+- `docs/03-input.md` 在"架构方案对比"开头加一句限定:"以下三个方案讨论的是非 tmux 通用 App 输入场景;SSH+tmux 场景的语音→命令路径见 docs/06"(配合本文 §0.5 的边界声明)
+- `docs/03-input.md` 的 Phase 0/1/2 上手路径与本文 Phase 0/1/2/3/4 编号重叠且含义不同,建议改名为 "Stage A/B/C" 之类避免读者混淆
 - `docs/05-roadmap.md` 的"近期/中期"按本文 Phase 0-2 重新组织
-- `README.md` 的工作流示例 — 把"语音 → 终端"那一段从抽象描述改为本设计的具体形态(可选)
+- `README.md` 的"输入方案"段落里,在引用 03 的三方案对比时补一句"以下方案适用于非 tmux 场景;SSH+tmux 场景请见 docs/06"
 
 ---
 
