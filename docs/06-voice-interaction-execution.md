@@ -9,496 +9,522 @@
 
 也就是把"按一下中文键说话,terminal 里就出现命令"这件事拆到组件、接口、延迟、失败模式的颗粒度,目标是任何工程师拿到这份文档就能开始动手。
 
+本文给出**两套方案**:
+- [§1 当下主推方案:剪贴板桥接 + Claude Code](#1-当下主推方案剪贴板桥接--claude-code) — 工程量最小、复用现成 agent、推荐先实施
+- [§2 备选方案:Voice Gateway 双端架构](#2-备选方案voice-gateway-双端架构保留) — 完整自研,在主推方案不适用时考虑
+
+读这份文档的顺序建议:**§0.5 → §1 → 决定按 §1 实施 → §2 留作未来 reference**。
+
 ---
 
-## 0.5 与 docs/03 的边界关系(重要)
+## 0.5 主推 vs 备选 — 当下为什么选简化方案
 
-本文(06)与 [`docs/03-input.md`](03-input.md) 讨论的是**同一个交互问题在两个不同场景下的两条路径**,不是替代关系,也不是版本演进关系。读这两份文档时请先看清各自的覆盖范围:
-
-| 维度 | docs/06(本文) | docs/03 |
+| 维度 | §1 主推(剪贴板 + Claude Code) | §2 备选(Voice Gateway) |
 |---|---|---|
-| **目标场景** | SSH + tmux 的远程终端开发(本项目的核心场景) | 非 tmux 通用 App 输入(浏览器地址栏、聊天 App、其他 Android App)|
-| **文本"注入"发生在哪** | **云端**(`tmux send-keys` 直接进 SSH session) | **Beam Pro 端**(IME / AccessibilityService 注入到当前焦点 App) |
-| **Beam Pro 端是否需要处理文本注入** | **不需要**(只负责按键事件捕获 + 麦克风 + 候选 overlay) | **需要**(IME 注入到 EditText / AccessibilityService 注入到 UI 节点) |
-| **能否承载"意图 → LLM 翻译 → shell 命令"** | 是(核心路径) | 否(03 的方案是字面文本注入,不经过 LLM 翻译) |
-| **是否需要 Android Accessibility 权限** | 否 | 是(03 的方案二)|
+| 新增组件 | 1 个 Beam Pro Service(录音 + 豆包 + 剪贴板) | 1 Beam Pro Service + 1 云端 Gateway + WebSocket |
+| 文本注入位置 | Beam Pro 端(overlay 预览 + Enter 触发剪贴板粘贴) | 云端(`tmux send-keys`) |
+| LLM 意图理解 | Claude Code 本身(它本来就是 agent) | Voice Gateway 拼 prompt 调 Claude API |
+| 候选展示 | Claude Code plan 模式(主建议 + alternative) | overlay 显示 top-3,Tab 切换 |
+| 工程量(到 MVP) | ~1-2 周 | ~3-6 周 |
+| 依赖 Claude Code | 是 | 否(可换 Codex / 本地 LLM) |
+| 多端共享 voice 服务 | 否(每个 Beam Pro 独立) | 是(同一 Gateway 多客户端) |
+| 音频可不上云 | 否(豆包要上云) | 是(本地 faster-whisper) |
+| 依赖 tmux | 否(任意 shell) | 是 |
 
-### 为什么 06 不走 IME / AccessibilityService 路径
+**主推选择的根因**:Claude Code 本身已经是成熟的 agent —— 它做意图理解、工具调用、context 管理、plan/confirm 流程,几乎覆盖了 Voice Gateway 设计要做的 90%。补上"接受语音输入"这 10%(剪贴板桥接),剩下的让 Claude Code 接管,工程量直接砍 2-3 倍。
 
-在 SSH + tmux 场景下,**Beam Pro 上的 SSH client 不是"被注入文本"的目标**,而是"被动接收 tmux 推过来的字节流"的显示器。云端 `tmux send-keys -t dev "命令"` 等价于"有人在隔壁帮你打字",Termius/Termux 那边的 terminal 流里自然出现这一行,完全绕开了 docs/03 讨论的"语音输出的文字应该通过什么渠道送进 App"这个问题。
-
-也就是说:**docs/03 的"三大方案对比"在 SSH+tmux 场景下整段不进入决策空间**;那个对比是为了解决非 tmux 通用 App 输入场景而存在的。
-
-### 两份文档怎么共存
-
-- 如果你 100% 都在 SSH+tmux 里工作:按 06 实施即可,03 的 IME/AccessibilityService 讨论不需要落地
-- 如果你也有"在 Beam Pro 浏览器地址栏说话输入网址"这种需求:那部分按 03 实施(IME 或 AccessibilityService),与 06 在同一个 Voice/Key Daemon 进程里共存即可 — 按键事件捕获、PTT 录音、ASR 三个组件可以复用,只是输出去向(tmux send-keys vs 本地 IME/Accessibility)按当前 App 路由
-
-### 如果将来 03 的范围调整
-
-如果 docs/03 后续调整为也覆盖 tmux 场景(比如选了某种本地注入路径与 06 直接竞争),那两份文档需要做一次合并 review,确定 single source of truth。目前(2026-05)按上表的分工读即可。
+**备选保留的原因**:在"不用 Claude Code / 要本地 ASR / 多设备共享 / 工程团队要细粒度可控中间层"这些场景下,Voice Gateway 仍是合理设计 —— 见 [§2.0 何时重新评估](#20-何时重新评估)。
 
 ---
 
-## 1. 设计原则
+# § 1. 当下主推方案:剪贴板桥接 + Claude Code
+
+## 1.1 一句话拓扑
+
+```
+[按住 F13 中文 / F14 英文] → Beam Pro overlay 立即激活 → 录音 → 松开
+                                                            │
+                                                            ▼ 豆包 ASR(境内)
+                                                Beam Pro overlay 显示 ASR 文本(预览)
+                                                            │
+                              ┌─────────────────────────────┼─────────────────────────────┐
+                              ↓                             ↓                             ↓
+                          [按 Enter 确认]                [按 Esc 撤销]              [再按 F13/F14 重说]
+                              │                             │                             │
+                       写剪贴板 + 触发粘贴              关闭 overlay               关闭旧 overlay,
+                       到 Termius(机制见 §1.3.1.1)     (不发送任何文本)            立即激活新 overlay
+                       + 关闭 overlay                                              并重新录音
+                              │
+                       SSH → 海外服务器
+                              │
+                       Claude Code(plan 模式)
+                              │
+                       看建议 → Enter 确认 / 编辑 → 执行 → 输出回流 → Termius 显示
+```
+
+整套系统**只有一个新组件**:Beam Pro 上的 Voice Daemon(按键 → 录音 → 豆包 → overlay 预览 → 写剪贴板 + 模拟粘贴)。其他全部复用现成的(8BitDo / Termius / Claude Code / 你的 SSH server)。
+
+**两层防误**:
+- **第一层(Beam Pro 端)**:ASR 文本对不对 → overlay 上一眼看清楚 → Esc 撤销,Termius 永远不会被污染
+- **第二层(服务器端)**:意图理解对不对 → Claude Code plan 给出建议 → Ctrl+C 拒绝
+
+## 1.2 数据流详解(一次完整交互)
+
+```
+T+0ms        用户按下 F13(中文)
+T+30ms       Voice Daemon 收到 HID KeyDown
+             → 立即创建/重建 SYSTEM_ALERT_WINDOW overlay,显示"🎤 录音中..."
+             → AudioRecord.start()
+T+30..3030ms 用户说"看下 nginx 最近的错误"
+T+3030ms     用户松开 F13
+T+3050ms     AudioRecord.stop() → overlay 显示"识别中..."
+T+3060ms     音频(Opus ~10KB)→ POST 豆包 ASR(带[动态热词表](03-input.md#热词持续优化))
+T+3060..3550ms 豆包 ASR(端到端 ~500ms)
+T+3550ms     豆包返回 text: "看下 nginx 最近的错误"
+T+3580ms     overlay 切换显示:┌──────────────────────────────────┐
+                              │ 🎤 看下 nginx 最近的错误            │
+                              │                                  │
+                              │  Enter 发送   Esc 撤销   F13 重说  │
+                              └──────────────────────────────────┘
+
+[分支 A]:用户按 Enter 确认
+T+N          Enter KeyDown(被 overlay 焦点拦截,不落到 Termius)
+T+N+10ms     Voice Daemon 写 ClipboardManager.setPrimaryClip(text)
+T+N+30ms     触发粘贴到 Termius(具体机制见 §1.3.1.1,Stage A 必须验)
+T+N+50ms     overlay 关闭 → 焦点还给 Termius
+T+N+100ms    Termius 收到字符 → 把字符通过 SSH 流推到服务器
+T+N+200ms    Claude Code 在 server stdin 收到这段文本
+T+N+200ms..  Claude Code 思考 + 调 bash 工具
+T+N+3-6s     Claude Code plan:"我打算运行 `tail -100 /var/log/nginx/error.log`"
+T+N+P        用户按 Enter 确认 → 执行 → 输出回流
+
+[分支 B]:用户按 Esc 撤销
+T+N          overlay 关闭,什么都不发送
+             → Termius 保持原状,Claude Code 完全没看到这次失败的 ASR
+
+[分支 C]:用户按 F13 重说
+T+N          立即关闭旧 overlay
+T+N+10ms     创建新 overlay,显示"🎤 录音中..."
+T+N+10ms     AudioRecord.start()
+             ...回到 T+30 流程重新走一遍
+```
+
+**整体时延**:
+- 从松开 PTT 到 overlay 显示预览:**~500ms**(豆包 ASR)
+- 从 Enter 确认到 Claude Code plan 出来:**~3-6s**(SSH 传输 + Claude Code 思考)
+- 总:**4-7s**
+
+比 §2 的 top-3 方案略长,但**多了一个 0 延迟的 ASR 撤销机制** — 误识别的代价从"污染 Claude Code session 要解释/撤销"降为"按一下 Esc 当无事发生"。
+
+## 1.3 组件分解
+
+### 1.3.1 Voice Daemon(Beam Pro 上)
+
+唯一需要新写的组件。
+
+| 项 | 选择 |
+|---|---|
+| 语言 | Kotlin / React Native(Stage A 可 Tasker + 脚本) |
+| 形态 | Android Foreground Service + 通知 |
+| 权限 | `RECORD_AUDIO`, `BLUETOOTH_CONNECT`, `SYSTEM_ALERT_WINDOW`(overlay) |
+| **不需要** | Accessibility Service、root |
+
+职责(按状态机组织):
+
+```
+状态: IDLE
+  ↓ F13/F14 KeyDown
+状态: RECORDING(overlay 显示"🎤 录音中...")
+  ↓ F13/F14 KeyUp
+状态: ASR_PENDING(overlay 显示"识别中...")
+  ↓ 豆包返回 text
+状态: PREVIEWING(overlay 显示 text + 三个操作提示)
+  ├─ Enter → COMMITTING(写剪贴板 + 触发粘贴到 Termius,机制见 §1.3.1.1)→ overlay 关闭 → 回 IDLE
+  ├─ Esc → overlay 关闭 → 回 IDLE(不发送任何文本)
+  └─ F13/F14 → 关 overlay → 回 RECORDING(重说)
+```
+
+**关键设计**:Enter/Esc 复用 Termius 标准键,Voice Daemon 只在 overlay 显示时通过焦点机制拦截(`SYSTEM_ALERT_WINDOW` focusable=true)。overlay 关闭后焦点立刻还给 Termius,Enter/Esc 恢复正常 Termius 语义。这样**新增的物理键只有 F13/F14 两个**。
+
+核心操作:
+- **HID 按键监听**:`InputDevice` 拿 8BitDo 的 F13/F14(全局监听);Enter/Esc 通过 overlay focusable 拦截
+- **PTT 录音**:`AudioRecord` 16kHz mono PCM,Opus 实时编码
+- **豆包 ASR 调用**:HTTPS POST,带[动态热词表](03-input.md#热词持续优化)
+- **Overlay 渲染**:`SYSTEM_ALERT_WINDOW` 浮在前台 App 上方,简单文本框
+- **剪贴板 + 模拟粘贴**:`ClipboardManager.setPrimaryClip(...)` + 用 `Instrumentation.sendKeyDownUpSync` 或 dispatchEvent 发 Ctrl+Shift+V 给前台 App
+- **错误处理**:豆包失败 → overlay 显示错误信息 + 仍允许 Esc / F13 重说
+
+### 1.3.1.1 "Enter 一键发送"的技术约束 ⚠️ 最大未知项
+
+主推方案的简化目标是 **overlay 显示时 Enter = 确认 + 发送 + 关 overlay**,不引入额外按键。但这要求 Voice Daemon 在按 Enter 时完成:
+
+1. 写剪贴板 — ✓ 标准 ClipboardManager 即可
+2. 把文本"塞进"Termius — ⚠️ 这一步在 Android 安全模型下需要权限
+3. 关闭 overlay 并把焦点还给 Termius — ✓ 标准 WindowManager 即可
+
+第 2 步是关键卡点。`SYSTEM_ALERT_WINDOW` 允许浮窗 + 抢键,**但不允许跨 App 注入按键事件**(无法模拟 Ctrl+Shift+V 给 Termius)。可行路径列举:
+
+| 路径 | 权限要求 | "Enter 一键"能否实现 | 备注 |
+|---|---|---|---|
+| Voice Daemon 内部模拟 Ctrl+Shift+V(`Instrumentation`)| 无 | ❌ | 只能作用于 Voice Daemon 自己,Termius 收不到 |
+| **AccessibilityService.performAction(ACTION_PASTE 或 setText)** | Accessibility | ✅ | Termius 输入区不一定支持 ACTION_PASTE,需实测 |
+| **Termius 接收 Intent 推送文本** | 无 | ✅ | 取决于 Termius 是否暴露此 Intent;**Termux 支持**(`am start -a android.intent.action.SEND -t text/plain --es Intent.EXTRA_TEXT "..."`)— Termius 待验 |
+| **Shizuku** + `input keyevent` | 用户激活 Shizuku(一次性 ADB) | ✅ | 零运行时权限,但需要 Shizuku 框架已安装并激活 |
+| **8BitDo 把 Enter 物理键直接配成 Ctrl+Shift+V** | 无 | ⚠️ | Voice Daemon 拦不到 Enter 这个语义,只能用别的键(或物理键发组合序列)做 overlay 确认。或者:Enter 物理键由 Voice Daemon 监听抢键 + 不传给 Termius,接受后 Voice Daemon 用上面任一机制再触发粘贴 |
+
+**Stage A 必须按优先级实测**:
+1. 先验 **Termius Intent 接收文本** — 如果可行,零权限拿下,最干净
+2. 其次验 **AccessibilityService.ACTION_PASTE on Termius** — 牺牲一个权限拿稳定
+3. 备选 **Shizuku** — 用户能接受 ADB 激活时
+
+**如果 1/2/3 都不通**,有两条退路:
+- 回到 docs/03 §架构方案二的 AccessibilityService 完整路径,接受权限代价
+- **降级 Enter 语义**:overlay 显示时按 Enter 只做"关 overlay + 写剪贴板",用户再按一次物理粘贴键(违背"Enter 一键"的简化精神,但保证可用)
+
+这是简化方案的**最大单点不确定性**,Stage A 必须解决,否则全局架构要调整。
+
+### 1.3.2 8BitDo Micro(物理按键)
+
+按 [`docs/03-input.md`](03-input.md) 推荐的键位映射,**语音交互只新增两个键**(F13、F14),Enter/Esc 复用 Termius 的标准键:
+
+| 物理键 | 键码 | overlay 关闭时(普通终端)| overlay 显示时(语音交互)|
+|---|---|---|---|
+| 语音键 1 | F13 | (空,无功能)| **"录(再录)中文"** — 关旧 overlay,立即开新 overlay 进入 PTT |
+| 语音键 2 | F14 | (空,无功能)| **"录(再录)英文"** — 同上,语种 = en |
+| Enter | `Enter` | Termius 普通 Enter(命令执行 / Claude Code plan 确认)| **确认提交** — 见 §1.3.1.1 的实际机制 |
+| Esc | `Esc` | Termius 普通 Esc | **撤销** — 关 overlay,不发送 |
+| 其他终端键 | Ctrl/Tab/↑↓/Ctrl+Shift+V ... | 见 docs/03 键位表 | (Voice Daemon overlay 模态下不响应)|
+
+**核心简化**:语音相关的新键只有 F13、F14;Enter/Esc 复用 Termius 已有的键,Voice Daemon 通过 overlay 的 modal 状态决定是否拦截。这样:
+- overlay 不显示 = Beam Pro 一切如常,Termius 正常工作
+- overlay 显示 = Voice Daemon 接管 Enter/Esc,处理完后释放回 Termius
+
+**关键依赖(Stage A 必须验)**:
+- 8BitDo Micro 的 Ultimate Software 是否支持发 F13 / F14 键码(普通 App 不占用、Android 能识别)— 如果不能,退到 Ctrl+Alt+1 / Ctrl+Alt+2 组合键
+- Voice Daemon 的 SYSTEM_ALERT_WINDOW overlay 设 focusable=true 时能否抢键 + 关闭后焦点正确还给 Termius
+- Termius 是否对 Voice Daemon 关 overlay 后的瞬间"接收剪贴板"有兼容性问题(可能需要短暂 sleep)
+
+### 1.3.3 Termius(SSH client,零改造)
+
+- 启用 SSH `RemoteCommand` 或在 `~/.zshrc` 末尾自动启动 Claude Code:
+  ```
+  tmux new -A -s dev "claude code --resume"
+  ```
+- Termius 工具栏放好 Esc / Ctrl+C / Tab 等高频键
+
+### 1.3.4 Claude Code(服务器端,零开发)
+
+启动配置:
+
+```bash
+# ~/.config/claude/config.toml  (或 claude code 实际配置文件位置)
+# 建议配置:
+permission_mode = "plan"        # 默认 plan,看到建议再执行
+auto_compact = true             # 长会话自动压缩 context
+```
+
+或启动时:
+```bash
+claude code --permission-mode plan --resume
+```
+
+`plan` 模式让 Claude Code "先说我打算做什么,等用户 Enter 确认再执行" — 这是用户安全感的关键。
+
+## 1.4 与 docs/03 的关系
+
+**§1 主推方案 = docs/03 方案二/三(本地注入 + 渐进上手)+ Claude Code 作为意图理解层**。
+
+具体对应:
+- docs/03 §硬件方案一(8BitDo Micro)→ 本文 §1.3.2
+- docs/03 §架构方案二(本地注入)的"剪贴板路径" → 本文核心机制
+- docs/03 §架构方案三(渐进路径)的 Phase 0/1 → 本文 [Stage A/B](#15-实施-stage-a--b--c) 的简化形式
+- docs/03 §热词持续优化 → 本文 §1.3.1 直接复用
+
+**不冲突,不重复设计** — docs/03 讨论的是"按键 + ASR + 本地注入"这一组通用机制,本文是"把这组机制 + Claude Code 组合起来支撑 SSH 终端开发场景"的具体落地。
+
+PR #6 写在原 §0.5 里"docs/06 = tmux send-keys 不绕开本地注入,docs/03 = 本地注入"的边界,在新主推方案下已**不再准确** — 主推方案恰好就走本地注入路径。新边界:
+- 主推方案 §1 ≈ docs/03 的本地注入 + Claude Code(命中本项目核心场景)
+- 备选方案 §2 ≈ 原 docs/06 设计(tmux send-keys 路径,在不用 Claude Code 等场景下保留价值)
+
+## 1.5 实施 Stage A / B / C
+
+(用 Stage A/B/C 避免与 docs/03 Phase 0/1/2 或 §2 备选方案的 Phase 0-4 编号撞车)
+
+### Stage A:可行性硬验证(1 周,纯手动 + 1 个最小脚本)
+
+**不写完整 app**,先验证两个核心假设:
+1. **8BitDo Micro 真的能配出 PTT 键** — Ultimate Software 给"按住时持续发某键码,松开停"的能力
+2. **豆包 ASR 对你的常用中英混说指令准确率够用** — 准确率门槛 ≥ 70% 才进 Stage B
+
+具体:
+
+```bash
+# A1: 录 30 句日常远程开发指令(自然说,中英混)
+# A2: 调豆包 ASR API,得到 30 条 text
+# A3: 把每条 text 当作 prompt 喂给 server 上的 Claude Code(--permission-mode plan)
+# A4: 人工标注:Claude Code 给出的 plan 是不是"对的命令"
+# A5: 计算可执行率
+```
+
+`Voice Daemon` 这阶段不存在 — 你手动 curl + paste 验证整条 pipeline 是否工作。门槛过了才值得投入开发。
+
+### Stage B:MVP(1-2 周)
+
+写 Voice Daemon 最小可用版:
+- Tasker + AutoTools 调录音 + curl 豆包 + 写剪贴板(零原生代码,1-2 天)
+- 或 Kotlin Foreground Service + AudioRecord + Retrofit 调豆包(更正经,1-2 周)
+- 不做 overlay,识别结果通过 Android Notification 显示
+
+跑通端到端"按键 → 说话 → 粘贴 → Claude Code plan → 确认 → 执行"。
+
+### Stage C:体验优化(持续)
+
+- 加 overlay visual confirm("已识别:XXX")
+- 加[动态热词表](03-input.md#热词持续优化)
+- Voice Daemon 自启动 + 后台稳定性优化
+- 多设备同步剪贴板(可选,laptop + Beam Pro 共享 ASR 服务)
+
+## 1.6 失败模式与降级
+
+| 故障 | 检测 | 用户体感 | 恢复 |
+|---|---|---|---|
+| 豆包 ASR 识别错(高频)| overlay 显示明显不对的文本 | 一眼看清 | **按 Esc 撤销** — Termius 永远不会被污染,这是 overlay 设计的核心价值 |
+| 豆包 API 失败 / 限流 | HTTP 非 200 / 超时 | overlay 显示"ASR 失败" | 自动重试 1 次;再失败按 Esc / F13 重说 |
+| 网络断 | 上传超时 | overlay 显示"网络断" | overlay 不关,网络恢复可按 F13 重录 |
+| 8BitDo 蓝牙断 | Daemon 收不到 HID 事件 | 按键无响应 | Notification "蓝牙断开" + Daemon 后台重连 |
+| Claude Code 进程死 | SSH 上敲 Enter 无响应 | shell prompt | 手动 `claude code --resume`,session 不丢 |
+| 注入到 Termius 失败 | Enter 后 Termius 无字符进入 | 看到 overlay 关了但 terminal 没动 | 内容仍在系统剪贴板,用户手动 Ctrl+Shift+V 兜底(见 §1.3.1.1 降级) |
+| 整套语音崩 | — | 都不响应 | 退回 Termius 直接打字 + Claude Code 文本对话,完全可用 |
+
+**核心降级承诺**:Voice Daemon / 豆包 / 8BitDo 任何一个挂了,**Termius + Claude Code 继续可用** — 你打字跟 Claude Code 对话是 fallback 路径。
+
+## 1.7 关键技术选择
+
+### 1.7.1 ASR:豆包(火山引擎 ASR)
+
+为什么:
+- 中英混说能力强(国内 ASR 厂商在中英混领域已经做得不错)
+- 支持热词偏置(配合 docs/03 §热词持续优化)
+- 境内厂商境内调用,延迟低(Beam Pro 在国内,豆包也在国内,一跳)
+- 价格便宜(0.0015 元/秒,1 小时音频 ~5 元)
+
+trade-off:
+- 音频必上云(豆包是云服务,无本地版本)
+- 锁定豆包 API 协议(切换 provider 要改 Daemon)
+
+如果隐私是硬需求,见 [§2 备选方案](#2-备选方案voice-gateway-双端架构保留) 的本地 ASR 选项。
+
+### 1.7.2 LLM 在哪调
+
+**不需要单独调** — Claude Code 自己调,Voice Daemon 完全不碰 LLM。
+
+Beam Pro 端只做"录音 + ASR + 写剪贴板",所有意图理解和命令翻译由服务器侧的 Claude Code 接管。这意味着:
+
+- Anthropic API key 只在服务器上(Beam Pro 不存)
+- LLM 出网走 VPS 国际出口(比 Beam Pro 4G 出海稳)
+- Claude Code 的 session 持续性、context 管理、工具调用等能力都自动复用
+
+### 1.7.3 中英语种切换
+
+按 docs/03 现有方案 — 两个 PTT 键分别对应中文 / 英文 ASR 模式,通过 Voice Daemon 给豆包 API 传不同 `language` 参数。
+
+实际重要性:在豆包 ASR 中英混说已不错的情况下,硬切换的边际价值约 5-10%。键位代价低,保留无损。
+
+### 1.7.4 服务器位置
+
+推荐**海外服务器 + mosh**,理由见与本设计配套的部署考量:
+
+- SSH 字符回显在海外链路下用 mosh(local echo + 差量同步)体感接近本地
+- 服务器侧的 Claude Code 直连 Anthropic API 最稳(VPS 国际出口比 Beam Pro 4G 强)
+- `git pull` / `docker pull` 等海外工具链顺畅
+
+音频不绕服务器 —— Beam Pro 直接到豆包(境内一跳),不污染国际出口。
+
+---
+
+# § 2. 备选方案:Voice Gateway 双端架构(保留)
+
+> **状态**:未选为当前主推方案。原文档(本节即原 docs/06 v1 的设计)完整保留,在以下场景重新评估时仍是合理设计。
+
+## 2.0 何时重新评估
+
+回到 Voice Gateway 方案值得在以下任一情况触发:
+
+- **不再使用 Claude Code 作为主 agent** — 比如换 Codex CLI(其 plan/confirm 体验更弱)或自建 LLM agent
+- **音频必须不出云** — 隐私合规要求 ASR 本地化(需要 faster-whisper on server)
+- **多个 Beam Pro / 多设备共享同一语音服务** — Voice Gateway 是天然的多 client 服务,主推方案是单设备绑定
+- **需要 top-3 候选 + Tab 切换的体验** — 主推方案的 plan 模式给 1 个建议,要在 N 个 plausible 实现间挑时不如 top-3 高效
+- **不用 tmux 或 Claude Code 无法常驻** — Voice Gateway 不依赖 tmux/agent 常驻
+- **要细粒度的命令 risk 标记 + 强制二次确认** — Voice Gateway 在 prompt 层强制,主推方案靠 Claude Code 的权限模式(较粗)
+
+如果上面有任意一条命中,回头读 §2.1 - §2.11 评估是否值得切换。
+
+## 2.1 设计原则
 
 1. **terminal 主路径不动** — SSH + tmux,语音是 augmentation,不是替代
 2. **语音不是键盘替代,是意图通道** — LLM 做"自然语言意图 → shell 命令"的翻译;不试图让 ASR 直接吐出 `/var/log/nginx/access.log` 这种字符级精确字符串
 3. **双端架构** — Beam Pro 端负责事件捕获和 UI,云端负责 ASR/LLM/注入;不同关注点分离
 4. **优雅降级** — 网络断、ASR 崩、LLM 错,任何时刻能退回纯键盘继续工作
 5. **不依赖 root / 越狱** — 所有组件用标准 Android 权限和云端 user shell 权限
-6. **场景边界明确**:本设计假设 SSH + tmux 场景;非 tmux 通用 App 输入的方案见 [`docs/03-input.md`](03-input.md) 的 IME/AccessibilityService 讨论(详见 §0.5)
 
----
-
-## 2. 整体架构
+## 2.2 整体架构
 
 ```
 ┌──────────────────────────────┐           ┌──────────────────────────────┐
 │         Beam Pro             │           │       云端 Ubuntu             │
-│  ──────────────              │           │  ──────────────                │
 │                              │           │                              │
 │  [SSH client]──SSH───────────┼───────────┼──→  tmux session: dev         │
-│  Termius/Termux/Blink        │           │      (你的 shell 长期住在这)   │
 │       ↑                      │           │                ↑              │
 │       │ stdin/stdout         │           │                │ send-keys    │
-│       │ (terminal 流)        │           │                │              │
 │                              │           │                              │
 │  [Voice/Key Daemon]          │           │  [Voice Gateway]              │
 │  (Android Foreground Service)│           │  (Python FastAPI + WS)        │
 │   - 监听蓝牙 HID 按键事件     │           │   - ASR(faster-whisper /     │
-│   - PTT 录音(AudioRecord)   │           │     OpenAI Whisper API)      │
+│   - PTT 录音                 │           │     OpenAI Whisper API)      │
 │   - 流式上传音频 ────────────┼─WSS──────→│   - tmux capture-pane 抓上下文│
 │   - 接收候选 ←───────────────┼─WSS──────│   - Claude API → top-3 候选    │
 │   - SystemAlertWindow overlay│           │   - tmux send-keys 注入       │
 │   - 按键选择 ────────────────┼─WSS──────→│   - 会话状态(lang/session)   │
-│                              │           │   - 仅监听 127.0.0.1:18800   │
-└──────────────────────────────┘           │     (SSH 隧道或 Tailscale 暴露)│
-                                            └──────────────────────────────┘
-
-依赖关系:Voice Gateway 进程独立于 Nginx,本设计不复用 nginx 这条路径。
-        语音通道走单独的 WebSocket over SSH/Tailscale。
+└──────────────────────────────┘           └──────────────────────────────┘
 ```
 
-3 个核心组件:**Voice/Key Daemon**(Beam Pro)、**Voice Gateway**(云端)、**现成的 SSH client + tmux**(零改造)。
+3 个组件:**Voice/Key Daemon**(Beam Pro)、**Voice Gateway**(云端 Python 服务)、**SSH client + tmux**(零改造)。
 
----
+## 2.3 关键技术决策
 
-## 3. 组件分解
+### 2.3.1 命令注入:`tmux send-keys`
 
-### 3.1 Voice/Key Daemon(Beam Pro,Android Foreground Service)
+云端 Voice Gateway 拿到 LLM 翻译的命令后直接 `tmux send-keys -t dev "..."`(不带 Enter,留给用户最后确认)。Termius 那边的 terminal 流自然出现这一行字符。
 
-| 项 | 选择 |
-|---|---|
-| 语言 | Kotlin(原生)/ React Native(MVP 可用) |
-| 形态 | 前台 Service + Notification(确保不被系统杀)|
-| 权限 | `RECORD_AUDIO`, `SYSTEM_ALERT_WINDOW`, `BLUETOOTH_CONNECT` |
-| 不需要 | root / Accessibility Service |
+不需要在 Beam Pro 端处理任何文本注入。
 
-职责:
-- **HID 事件捕获**:Android `InputDevice` API 拿到蓝牙 macropad 按键(QMK 键位 → 自定义 keycode)
-- **PTT 录音**:按下"语音键"时 `AudioRecord` 16kHz mono PCM 开始;松开停止
-- **音频流式上传**:每 200ms 一个 chunk 通过 WebSocket 发到 Voice Gateway,不等录音结束(降首字延迟)
-- **Overlay 渲染**:候选条用 `WindowManager.addView(LayoutParams.TYPE_APPLICATION_OVERLAY)` 浮在 SSH client 之上
-- **按键选择反馈**:Tab 切候选,Enter 选定,Esc 取消 → 通过 WS 告知 Gateway
+### 2.3.2 候选 UI:Beam Pro `SYSTEM_ALERT_WINDOW` overlay
 
-### 3.2 Voice Gateway(云端 Ubuntu,Python FastAPI)
+LLM 返回 top-3 候选,Beam Pro overlay 显示:
+- Tab 切候选
+- Enter 选定
+- Esc 取消
 
-| 项 | 选择 |
-|---|---|
-| 语言 | Python 3.11+ (FastAPI + uvicorn) |
-| 部署 | systemd service,`User=foxer`(不要 root) |
-| 监听 | `127.0.0.1:18800`(仅本地,通过 SSH 端口转发或 Tailscale 暴露)|
-| 持久化 | 无(无状态,重启不丢任何关键数据) |
+### 2.3.3 ASR 位置
 
-职责:
-- 接收音频 chunk → 调 ASR(策略见 §6.3)
-- 调 `tmux capture-pane / display-message / list-windows` 抓 context
-- 拼 prompt 调 Claude API,要 JSON 化的 top-3 候选
-- 收到 select → 调 `tmux send-keys -t $session "$cmd"`(**不带 Enter**,留给用户手动 Enter)
-- 全程 WS 双向消息
+| 方案 | 延迟 | 网络 | 隐私 |
+|---|---|---|---|
+| 云端 faster-whisper | 0.5-1s | SSH 隧道 | 自主 |
+| OpenAI Whisper API | 1-2s | 强网络 | 数据出云 |
+| Beam Pro 本地 whisper.cpp | 0.3-0.8s | 无 | 全本地 |
 
-### 3.3 SSH client + tmux(零改造)
+MVP 全云端,Phase 3 加本地兜底。
 
-- SSH client 任选(Termius / Termux + ssh / Blink Shell / Mosh)
-- 云端 `~/.bashrc` 或 SSH `RemoteCommand` 自动 `tmux new -A -s dev`,确保你 SSH 进去就在 tmux 里
-- tmux session 命名约定:`dev`(每台服务器一个固定名),Voice Gateway 默认操作这个 session
+### 2.3.4 LLM Prompt
 
----
-
-## 4. 数据流详解(一次完整交互)
-
-```
-T+0ms      用户按下"中文键"(QMK keycode 0xC0)
-T+30ms     Daemon: 收到 KeyDown 事件 → AudioRecord.start()
-T+30ms..   用户说"看下 nginx 最近的错误"
-T+3030ms   用户松开按键
-T+3050ms   Daemon: AudioRecord.stop(),flush 最后 chunk
-T+30..3050 Daemon → Gateway: WS audio_chunk × N(流式,不等结束)
-T+3070ms   Gateway: ASR 处理最后 chunk,产出 final text
-T+3170ms   Gateway: `tmux capture-pane -p -S -30` + 当前目录 + 最近命令
-T+3270ms   Gateway → Claude API(stream)
-T+4500ms   Claude: 首个候选完整 token 出来
-T+4550ms   Gateway → Daemon: candidates 消息(top-3)
-T+4650ms   Daemon: overlay 渲染候选条
-T+4650ms+  用户看候选,按 Tab/Enter/Esc
-T+N        Daemon → Gateway: select {index: 0}
-T+N+30ms   Gateway: `tmux send-keys -t dev "tail -100 /var/log/nginx/error.log"`
-T+N+50ms   命令字面出现在 terminal(用户视角)
-T+N+50+    用户按 Enter 执行(或编辑修改)
-```
-
-**总体感**:从松开 PTT 到候选出现,**~1.5s(本地 ASR)~3s(云端 ASR + 良好网络)~5s(4G 弱信号)**。
-
----
-
-## 5. 接口定义
-
-### 5.1 WebSocket 连接
-
-`wss://gateway.local:18800/ws?device=beam_pro_001&session=dev`
-
-`device` 用于多设备区分,`session` 是 tmux session name。
-
-### 5.2 Beam Pro → Voice Gateway(client → server)
+Voice Gateway 抓 context(tmux capture-pane + history + cwd)拼 prompt,要求 Claude 返回 JSON 化的 top-3:
 
 ```jsonc
-// 会话初始化
-{ "type": "hello", "device": "beam_pro_001", "session": "dev", "version": "0.1" }
-
-// 流式音频块
-{ "type": "audio_chunk", "req_id": "r_abc", "seq": 0, "lang": "zh", "data_b64": "<pcm16 chunk>" }
-{ "type": "audio_chunk", "req_id": "r_abc", "seq": 1, "lang": "zh", "data_b64": "..." }
-
-// 录音结束信号
-{ "type": "audio_end", "req_id": "r_abc" }
-
-// 候选选择
-{ "type": "select", "req_id": "r_abc", "candidate_index": 0 }
-
-// 用户取消(按 Esc)
-{ "type": "cancel", "req_id": "r_abc" }
-
-// 心跳
-{ "type": "ping" }
-```
-
-### 5.3 Voice Gateway → Beam Pro(server → client)
-
-```jsonc
-// ASR 部分结果(可选,流式展示)
-{ "type": "asr_partial", "req_id": "r_abc", "text": "看下 nginx" }
-
-// ASR 最终结果
-{ "type": "asr_final", "req_id": "r_abc", "text": "看下 nginx 最近的错误" }
-
-// 候选命令
 {
-  "type": "candidates",
-  "req_id": "r_abc",
-  "items": [
-    {
-      "cmd": "tail -100 /var/log/nginx/error.log",
-      "explain": "查看 nginx 错误日志最近 100 行",
-      "confidence": 0.92,
-      "risk": "read_only"
-    },
-    {
-      "cmd": "journalctl -u nginx --since '10 min ago' --no-pager",
-      "explain": "通过 systemd 看最近 10 分钟 nginx 日志",
-      "confidence": 0.78,
-      "risk": "read_only"
-    },
-    {
-      "cmd": "tail -f /var/log/nginx/error.log | grep -i error",
-      "explain": "实时跟踪 nginx 错误",
-      "confidence": 0.65,
-      "risk": "read_only_blocking"
-    }
+  "candidates": [
+    { "cmd": "tail -100 /var/log/nginx/error.log", "explain": "...", "confidence": 0.92, "risk": "read_only" },
+    { "cmd": "journalctl -u nginx --since '10 min ago'", "explain": "...", "confidence": 0.78, "risk": "read_only" },
+    { "cmd": "tail -f /var/log/nginx/error.log | grep -i error", "explain": "...", "confidence": 0.65, "risk": "read_only_blocking" }
   ]
 }
-
-// 注入完成
-{ "type": "injected", "req_id": "r_abc", "candidate_index": 0 }
-
-// 错误
-{ "type": "error", "req_id": "r_abc", "code": "asr_empty", "msg": "未识别到内容" }
-{ "type": "error", "req_id": "r_abc", "code": "llm_failed", "msg": "LLM 调用失败,可重试" }
-{ "type": "error", "req_id": "r_abc", "code": "tmux_no_session", "msg": "tmux session 'dev' 不存在" }
-
-// 心跳响应
-{ "type": "pong" }
 ```
 
 `risk` 字段约定:
-- `read_only`:纯读,无副作用
-- `read_only_blocking`:read-only 但会卡住 terminal(`tail -f`、`watch` 等)
-- `mutating`:会写文件 / 改服务 / 改数据库 — overlay 用红色高亮,Enter 选定后不立即 send-keys,要求二次确认
-- `destructive`:`rm -rf`、`drop`、`reset --hard` 等 — 默认不出现在候选里,LLM prompt 显式禁用
+- `read_only`:纯读
+- `read_only_blocking`:read-only 但卡终端(`tail -f` / `watch`)
+- `mutating`:写文件 / 改服务 — 二次确认
+- `destructive`:`rm -rf` / `drop` — 默认不出候选
 
----
+### 2.3.5 中英语种键
 
-## 6. 关键技术决策(每个有备选 + 推荐)
+降级为 ASR 的 `language` hint + LLM prompt 中的 `语种=zh|en` 提示。不是核心特性。
 
-### 6.1 命令注入机制
+## 2.4 WebSocket 接口定义(摘要)
 
-**决策**:`tmux send-keys`。
+```jsonc
+// client → server
+{ "type": "hello", "device": "...", "session": "dev" }
+{ "type": "audio_chunk", "req_id": "r_abc", "seq": 0, "lang": "zh", "data_b64": "..." }
+{ "type": "audio_end", "req_id": "r_abc" }
+{ "type": "select", "req_id": "r_abc", "candidate_index": 0 }
+{ "type": "cancel", "req_id": "r_abc" }
 
-| 维度 | tmux send-keys | HID emulation |
-|---|---|---|
-| 通用性 | 仅 tmux 会话 | 任何 input field |
-| 权限 | 云端 user shell 已有 | Android Accessibility Service / root |
-| 复杂度 | 一行 shell | InputManager 模拟键码序列 |
-| 与 form factor 匹配度 | 高(云端开发标配 tmux) | 通用但 overkill |
-
-**风险**:用户必须先 `tmux attach`。
-**缓解**:
-- SSH client 的 `RemoteCommand` 配置 `tmux new -A -s dev`(`-A` = attach if exists, else new)
-- Voice Gateway 启动时确保 named session 存在,不存在则创建:`tmux has-session -t dev || tmux new-session -d -s dev`
-
-### 6.2 候选 UI 形态
-
-**决策**:Beam Pro `SYSTEM_ALERT_WINDOW` overlay。
-
-| 方案 | 工作量 | 体验 | 备注 |
-|---|---|---|---|
-| **Android overlay** | 中(Kotlin Service) | 像 IME 候选条,符合"AI 浮窗" | 推荐 |
-| terminal 内嵌(fzf 风格)| 高(需自造 terminal 或 hack tmux)| 最原生 | 数月级工作量,排除 |
-| 独立浏览器 tab | 低 | 打断 terminal focus | 排除 |
-| Beam Pro 状态栏通知 | 低 | 选择交互困难 | 排除 |
-
-### 6.3 ASR 位置
-
-**决策**:**MVP 阶段全云端,Phase 3 加本地兜底**。
-
-| 方案 | 延迟 | 网络依赖 | 准确率 | 隐私 |
-|---|---|---|---|---|
-| OpenAI Whisper API | 1-2s | 强 | 高 | 数据出云 |
-| 云端自部署 faster-whisper(large-v3 量化)| 0.5-1s | 弱(SSH 隧道)| 最高 | 自主 |
-| **Beam Pro 本地 whisper.cpp(small/base 量化)** | 0.3-0.8s | 无 | 中 | 全本地 |
-
-**MVP**(Phase 1):云端 faster-whisper large-v3,工作量最低、准确率最高。
-
-**Phase 3**:加 Beam Pro 本地 small/base 作为快路径 — 本地秒出粗结果,云端 large 异步精修,差异 > threshold 时弹候选;断网时本地兜底。
-
-**Snapdragon 7 Gen 2 跑 whisper.cpp small 量化的实际延迟需要 Phase 0 实测确认**(本设计假设可达 < 1s)。
-
-### 6.4 LLM 选择
-
-**决策**:Claude(Sonnet 4.6 入门,降本可切 Haiku 4.5)。
-
-| 维度 | Claude Sonnet 4.6 | Gemini 2.5 Pro | 本地 qwen2.5-coder 32B |
-|---|---|---|---|
-| shell 知识深度 | 高 | 中 | 中 |
-| 意图理解 | 强 | 强 | 弱(无对话上下文) |
-| 工具调用 / JSON 模式 | 成熟 | 成熟 | 需 prompt engineering |
-| 延迟(首 token)| 300-600ms | 400-800ms | 取决于硬件 |
-| 成本 / 1000 次翻译 | ~$0.5(Sonnet) ~$0.1(Haiku)| ~$0.4 | 自建硬件分摊 |
-
-Claude 的强项是它对常见 Linux/macOS shell 范式的判断更稳(`journalctl` vs `tail` vs `less`,什么时候加 `--no-pager`,什么时候用 `-f`)。
-
-### 6.5 LLM Prompt 设计
-
-System prompt(精简):
-
-```
-你是 AR 眼镜 + tmux terminal 的语音助手。
-用户用语音表达"想做什么",你输出 3 个 shell 命令候选,JSON 格式。
-
-约束:
-- 命令必须在给定的服务器环境上可直接执行
-- 优先 read-only 命令;mutating 必须标 risk=mutating
-- 禁止 destructive(rm -rf / drop / reset --hard / chmod 777),除非用户明确说"删除/重置"
-- 命令尽量短,适合 AR 眼镜阅读(单行 ≤ 80 字符)
-- 不要包含 sudo,除非用户明示
-- 不要管道到 less / more(会卡住 tmux),用 tail/head 限定行数
-
-输出 JSON schema:
-{ "candidates": [{ "cmd": "...", "explain": "...", "confidence": 0..1, "risk": "read_only|read_only_blocking|mutating" }] }
+// server → client
+{ "type": "asr_final", "req_id": "r_abc", "text": "..." }
+{ "type": "candidates", "req_id": "r_abc", "items": [ ... ] }
+{ "type": "injected", "req_id": "r_abc", "candidate_index": 0 }
+{ "type": "error", "req_id": "r_abc", "code": "asr_empty", "msg": "..." }
 ```
 
-User message:
+## 2.5 延迟预算
 
-```
-服务器: ubuntu-prod-01 (Ubuntu 24.04)
-shell: zsh
-当前目录: /home/foxer/app
-最近 10 个命令:
-  git status
-  docker ps
-  ...
-最近 terminal 输出(最后 30 行):
-  [tmux capture-pane]
-最近一次 ASR 文本(语种=zh): "看下 nginx 最近的错误"
-```
-
-### 6.6 中英语种切换的角色
-
-**决策**:保留硬件键,但只作为 ASR 偏置 hint,不作为系统稳定性的核心依赖。
-
-理由(详见 issue 讨论):
-- 2026 SOTA 多语种 ASR 对 zh-en 混说 WER 已可控
-- 真正难的是 shell 路径/符号 — 语种切换救不了
-- 通过 LLM 翻译层吸收多语种波动后,硬切换的边际价值估计 < 5-10%
-- 但代价低(键位本来就有,ASR API 的 `language` 参数本来就要传),保留无损
-
-实操:
-- 中文键 → ASR 调用时 `language="zh"` + `initial_prompt="以下是中文语音指令"`
-- 英文键 → `language="en"` + `initial_prompt="The following is an English voice command"`
-- LLM prompt 末尾附 `语种=zh|en` 让 Claude 决定 explain 用什么语言
-
----
-
-## 7. 延迟预算与网络降级
-
-| 环节 | 本地 ASR | 云端 ASR(良好网络) | 云端 ASR(4G 弱信号) |
+| 环节 | 本地 ASR | 云端 ASR(良好网络)| 云端 ASR(4G 弱信号) |
 |---|---|---|---|
 | KeyUp → 录音停止 | 30ms | 30ms | 30ms |
 | 音频上传 | 0 | 200-500ms | 1-3s |
-| ASR 处理 | 300-800ms | 1-2s | 1-2s |
-| ASR text → Gateway | 50ms | 0 | 0 |
+| ASR | 300-800ms | 1-2s | 1-2s |
 | 拉 tmux context | 100ms | 100ms | 100ms |
 | Claude API 首 token | 600ms | 600ms | 1-2s |
 | Claude 完整 top-3 | +800ms | +800ms | +1-2s |
 | 候选下发 | 100ms | 100ms | 300-800ms |
 | **总计** | **~2.0s** | **~3.0s** | **~5-8s** |
 
-加上用户按 Tab/Enter 的反应 + tmux send-keys 注入 ~300ms。
+## 2.6 分阶段实施(原 Phase 0-4)
 
-**降级策略**:
+- **Phase 0**(1 周):录 30 句做可行性硬验证,可执行率 > 70% 才进 Phase 1
+- **Phase 1**(2-3 周):MVP,Tasker + AutoApps 监听按键 + 录音 + 上传;云端 200 行 FastAPI;单候选,无 overlay
+- **Phase 2**(2-3 周):Kotlin Service + SYSTEM_ALERT_WINDOW overlay,LLM top-3 + Tab 切换 + Enter 选定
+- **Phase 3**(2-4 周):本地 ASR(whisper.cpp)+ 流式 LLM
+- **Phase 4**(持续):语种、边缘情况、prompt 调优
 
-| 触发 | 行为 |
-|---|---|
-| ASR 延迟 > 5s | overlay 提示"网络慢,Esc 取消" |
-| ASR 返回空 | 红点提示"未识别,请重说",不打扰 terminal |
-| LLM 调用失败 | 自动重试 1 次;再失败则降级:把 ASR 文本直接 send-keys 到 terminal,用户自己改 |
-| LLM 返回非法 JSON | 同上 |
-| 完全离线 | Daemon 进入"local fallback":只显示 ASR 文本,不出候选;用户手动改 |
-| tmux session 不存在 | Gateway 自动创建,提示一次"已重建 dev session" |
+## 2.7 失败模式(摘要)
 
----
-
-## 8. 失败模式清单
-
-| 模式 | 检测 | 用户体感 | 恢复 |
-|---|---|---|---|
-| 蓝牙断开 | Daemon 收不到 KeyEvent | 按键无反应 | Daemon 后台尝试重连;状态栏图标变红 |
-| 麦克风被其他 app 占用 | `AudioRecord.startRecording` 失败 | overlay 弹"麦克风被占用" | 用户手动关闭占用 app |
-| WS 连接断 | onClose 事件 | 按键时 overlay 弹"未连接" | 自动重连(指数退避);Daemon 状态栏显示连接状态 |
-| ASR 模型加载失败 | Gateway 启动日志 | 静默,Gateway 不响应 hello | systemd 自动重启;运维介入 |
-| Claude API 限流 | HTTP 429 | overlay 弹"LLM 限流,改用本地兜底" | 用 ASR 文本直接 send-keys |
-| tmux pane 已被关闭 | `tmux send-keys` 退出码非 0 | 命令出不来 | 创建新 session,提示用户重新 attach |
-| 用户说错了 | — | overlay 出现明显不对的候选 | 按 Esc → 整条对话取消;按 Tab 看其他候选 |
+- 蓝牙断 / 麦克风占用 / WS 断:Daemon 端状态栏提示,自动重连
+- ASR 模型挂:systemd 重启
+- Claude API 限流:降级到 ASR 文本直接 send-keys,用户自己改
+- tmux session 不存在:Gateway 自动创建
 
 ---
 
-## 9. 分阶段实施
+# § 3. 与 repo 其它部分的关系
 
-### Phase 0:可行性硬验证(1 周,纯手动)
+## 3.1 新增 / 修改
 
-**不写任何 app**。在你自己的开发机上:
+主推方案 §1 落地涉及:
+- **新增**:`android/voice-daemon/` — Beam Pro 上的 Voice Daemon 代码(Stage B 开始)
+- **不动**:`scripts/sysinfo`、`ls-html`、`log-view` 等 — 继续作为 UI 多样性补丁的第 1 层
+- **不动**:Nginx serve HTML 那条路径 — 与本设计正交
 
-```bash
-# 录 30 句典型指令
-ffmpeg -f avfoundation -i ":0" -ar 16000 -ac 1 -t 5 utterance_01.wav
-# ...重复 30 次
+备选方案 §2 落地涉及(若启用):
+- **新增**:`gateway/` Python Voice Gateway
+- **新增**:`android/voice-key-daemon/` Beam Pro Daemon(含 overlay)
 
-# 批量 ASR
-for f in utterance_*.wav; do
-  curl https://api.openai.com/v1/audio/transcriptions \
-    -F file=@$f -F model=whisper-1 -F language=zh > "${f%.wav}.txt"
-done
+## 3.2 与 docs/03 的衔接
 
-# 批量 LLM 翻译
-for t in utterance_*.txt; do
-  claude -p "$(cat prompt-template.txt) 用户说:$(cat $t)" > "${t%.txt}.cmd.json"
-done
+主推 §1 直接使用 docs/03 §硬件方案一(8BitDo)+ §架构方案二(本地注入,剪贴板路径)+ §热词持续优化。如果将来 docs/03 的硬件选型或注入方案改了,本文 §1 跟随调整。
 
-# 人工标注:每条命令"能不能在我服务器上直接跑通"
-# 测三个指标:WER / 可执行率 / 端到端时间
-```
+## 3.3 与 docs/05-roadmap 的对齐
 
-**门槛**:可执行率 > 70% 才进 Phase 1。否则:换模型 / 改 prompt / 调整意图表达方式,再测。
-
-### Phase 1:MVP(2-3 周)
-
-**Beam Pro 端**:用 [Tasker](https://tasker.joaoapps.com/) + AutoApps 监听蓝牙键盘 + 录音 + curl 上传(零原生代码)。
-
-**云端 Voice Gateway**:200 行 FastAPI:
-
-```
-gateway/
-├── main.py              # FastAPI + WS endpoint
-├── asr.py               # OpenAI Whisper API 封装
-├── llm.py               # Claude API 封装,prompt + JSON parse
-├── tmux.py              # send-keys, capture-pane wrapper
-├── prompt.txt           # LLM system prompt
-└── systemd/
-    └── voice-gateway.service
-```
-
-**简化**:不做 overlay,LLM 只返回 1 个候选,直接 send-keys 到 terminal(不带 Enter),用户在 terminal 上看命令,按 Enter 执行 / Ctrl+C 否决。
-
-**目标**:端到端跑通"按键 → 说话 → 命令出现在 terminal"。
-
-### Phase 2:候选 + Overlay(2-3 周)
-
-- Beam Pro 端写 Kotlin Foreground Service + `SYSTEM_ALERT_WINDOW` overlay
-- LLM 返回 top-3
-- Tab 切换、Enter 选定、Esc 取消
-- 加 tmux capture-pane context
-- 加 risk 字段 + mutating 二次确认
-
-### Phase 3:本地 ASR + 流式(2-4 周)
-
-- whisper.cpp 集成到 Android(JNI)
-- 本地 small 模型快路径,云端 large 异步精修
-- 音频流式上传,LLM 流式输出,首 token 延迟 < 1s
-
-### Phase 4:语种 + 边缘 + prompt 调优(持续)
-
-- 中英语种键的 ASR / LLM 联动
-- 各种 mode(命令模式 / 描述模式 / 路径模式)
-- LLM prompt 持续根据失败案例调优
-- 多 tmux session 切换支持
+`docs/05-roadmap.md` 的"近期"建议按本文 §1 Stage A 重新排序:**先验证 8BitDo PTT + 豆包 ASR 准确率,再决定后续投入**。
 
 ---
 
-## 10. 与现有 repo 的关系
+# § 4. 未解决问题(进 Stage A 前需明确)
 
-### 新增
+按优先级排:
 
-- 本文 `docs/06-voice-interaction-execution.md`
-- 后续 PR(单独):
-  - `gateway/` — Voice Gateway Python 源码
-  - `android/` — Voice/Key Daemon Kotlin 项目
-  - `prompts/` — LLM prompt 模板
-
-### 不动
-
-- `scripts/sysinfo`, `ls-html`, `log-view` 等 — 继续作为 UI 多样性补丁的第 1 层(高频固定视图)
-- Nginx serve HTML 那条路径 — 与本设计正交,不冲突
-
-### 建议修改(单独 PR,不在本 PR 内)
-
-- `docs/03-input.md` 在"架构方案对比"开头加一句限定:"以下三个方案讨论的是非 tmux 通用 App 输入场景;SSH+tmux 场景的语音→命令路径见 docs/06"(配合本文 §0.5 的边界声明)
-- `docs/03-input.md` 的 Phase 0/1/2 上手路径与本文 Phase 0/1/2/3/4 编号重叠且含义不同,建议改名为 "Stage A/B/C" 之类避免读者混淆
-- `docs/05-roadmap.md` 的"近期/中期"按本文 Phase 0-2 重新组织
-- `README.md` 的"输入方案"段落里,在引用 03 的三方案对比时补一句"以下方案适用于非 tmux 场景;SSH+tmux 场景请见 docs/06"
+1. ⚠️ **"Enter 一键发送"的注入机制**(见 §1.3.1.1)— 优先验 Termius Intent 接收、其次 Accessibility ACTION_PASTE、备选 Shizuku。如果都不通,要么接受 Accessibility 权限,要么降级 Enter 语义(只关 overlay + 用户再按粘贴键)
+2. **8BitDo Micro 是否支持发 F13/F14 键码** — 不支持时退到 Ctrl+Alt+1/2 组合键
+3. **8BitDo Micro 的 PTT 持续键码能力** — Ultimate Software 是否支持"按住时持续发某键码",决定 PTT 是否可行
+4. **`SYSTEM_ALERT_WINDOW` overlay focusable=true 时的焦点切换** — 关 overlay 后焦点能否干净地还给 Termius;Termius 是否兼容这种瞬态焦点切换
+5. **豆包 ASR 对你的真实指令准确率** — Stage A 的核心人工评估项,门槛 ≥ 70%
+6. **Claude Code plan 模式的稳定性** — Claude Code session 长跑(>4h)是否会因 context 累积而行为漂移
+7. **Beam Pro 后台稳定性** — Foreground Service 在长时间 idle 时是否被 Android 杀(NebulaOS 的具体策略未知)
 
 ---
 
-## 11. 未解决问题(进 Phase 0 前需明确)
+# § 5. 总结一句话
 
-1. **Beam Pro 是否能跑 whisper.cpp small 量化在 < 1s 延迟内?** Phase 0 必须实测,否则 Phase 3 路径要重设计。
-2. **LLM context 截断策略** — 当 tmux pane 输出很长(`cat large.log`),context 怎么裁?最近 30 行?按 token 截?还是让 LLM 摘要?
-3. **多 tmux session 切换** — 你在 dev / prod / staging 几个 session 间切换时,Voice Gateway 怎么跟踪 active session?(候选方案:从 SSH client 通过 OSC 序列上报当前 session,或 Gateway 周期 `tmux list-clients` 探测)
-4. **Privacy 模型** — audio 是否上云?如果不上云,本地 ASR 是硬需求,Phase 3 不能延后
-5. **多设备并发** — 你 Beam Pro 和笔记本可能同时 attach 到同一 tmux session,语音注入时该向哪边显示候选?
-6. **Cost 上限** — 假设每天 50 次语音翻译,Sonnet 月成本约 ~$5;意外触发(误按)会不会失控?需要客户端 rate limit
+**主推**:Beam Pro 上一个最小 Voice Daemon — 监听 F13/F14 (PTT) → 录音 → 豆包 ASR → `SYSTEM_ALERT_WINDOW` overlay 显示预览 → 用户按 Enter(发送)/ Esc(撤销)/ F13-F14(重说)→ 通过 Termius Intent 或 Accessibility 把文本送进 Termius → SSH → Claude Code plan → 用户确认执行。**只新增 F13/F14 两个物理键 + 一个 Android Service**,其他复用现成的。
 
----
-
-## 12. 总结一句话
-
-**Voice/Key Daemon(Beam Pro Android Service)+ Voice Gateway(云端 Python)+ tmux send-keys**,SSH client 和 terminal 不动,通过 WebSocket 把"按键事件 + 麦克风"和"ASR + LLM + 命令注入"连起来。本设计不依赖 nginx、不依赖 root、不依赖任何 SSH client 的内部 API,所有改造点集中在两个新组件上。
+**备选**:不用 Claude Code、要本地 ASR、多设备共享、top-3 候选体验等场景下,回到 §2 的 Voice Gateway 双端架构。
