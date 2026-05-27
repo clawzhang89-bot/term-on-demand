@@ -41,6 +41,10 @@
 
 ## 架构方案对比
 
+> **适用场景说明：** 以下三个方案讨论的是**非 tmux 通用 App 输入场景**（浏览器地址栏、聊天 App、其他 Android App 的文本框）。
+> SSH + tmux 远程终端场景下，文本注入发生在**云端**（`tmux send-keys`），不需要在 Beam Pro 端做 IME/AccessibilityService 注入。
+> 详见 [`docs/06-voice-interaction-execution.md`](06-voice-interaction-execution.md)。
+
 8BitDo 注册为蓝牙键盘后，按键事件直接走 **Android Input Framework → App**，不需要任何软件介入。
 
 核心问题在于**语音输出的文字应该通过什么渠道送进 App**。
@@ -124,40 +128,42 @@ Termius / 浏览器             AccessibilityService   Intent
 
 ```
               ┌─────────────────────────────────────────┐
-Phase 0       │  8BitDo Micro          Gboard （语音输入）│
+Stage A       │  8BitDo Micro          Gboard （语音输入）│
               │  + Termius 工具栏    （Android 自带语音）  │
               │  零开发，验证核心交互                      │
               └─────────────────────────────────────────┘
                                    │
                                    ▼ 发现 Gboard 不够好
               ┌─────────────────────────────────────────┐
-Phase 1       │  8BitDo Micro          轻量 Voice Daemon │
+Stage B       │  8BitDo Micro          轻量 Voice Daemon │
               │                        (STT + 剪贴板输出) │
               │  （剪贴板辅助工具自动粘贴）                 │
               └─────────────────────────────────────────┘
                                    │
                                    ▼ 发现剪贴板不够流畅
               ┌─────────────────────────────────────────┐
-Phase 2       │  8BitDo Micro         完整 Voice/Key     │
+Stage C       │  8BitDo Micro         完整 Voice/Key     │
               │                        Daemon +           │
               │                        AccessibilityService│
               └─────────────────────────────────────────┘
 ```
 
-**Phase 0 — 零开发验证期**
+> **与 docs/06 的阶段区分：** 本文的 Stage A/B/C 是**通用 App 输入场景**的上手路径，而 docs/06 的 Phase 0/1/2/3/4 是 **SSH+tmux 场景**的实施路线。两者编号不同、场景不同，不要混淆。
+
+**Stage A — 零开发验证期**
 - 8BitDo Micro 到手配好键位映射
 - 语音用 Gboard 自带语音输入
 - Termius 上方 command bar 补充常用快捷键
 - 目标：先感受"物理键 + 语音"的工作流是否真的舒服
 
-**Phase 1 — 轻量 Voice Daemon**
+**Stage B — 轻量 Voice Daemon**
 - 写一个简版 Foreground Service 跑 STT
 - 语音转文字后写入系统剪贴板
 - 配合剪贴板同步工具（或手动按粘贴键）补上注入环节
 - 开始积累实际使用数据和路由规则
 
-**Phase 2 — 完整 AccessibilityService 版本**
-- 在 Phase 1 的基础上升级 Daemon + AccessibilityService
+**Stage C — 完整 AccessibilityService 版本**
+- 在 Stage B 的基础上升级 Daemon + AccessibilityService
 - 文本注入从"剪贴板+手动粘贴"升级为 AccessibilityService 自动注入
 - 加入系统命令路由（"打开浏览器"→startActivity）
 

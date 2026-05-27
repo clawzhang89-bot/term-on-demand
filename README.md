@@ -101,15 +101,18 @@
 
 **为何这样设计：** 终端操作本质上是精确交互（路径补全、参数调整、Ctrl 组合），语音不适合。中英文混说时语音识别最大的坑不是单条不准，而是**切换瞬间的模式漂移**——"/var/log"在中文模式下变成"瓦尔洛格"，"帮我查一下"在英文模式下变成"帮 my 茶 一下"。物理键硬切换是唯一的靠谱解法。
 
-**推荐实现：** 详见 [⌨️ 输入方案文档](docs/03-input.md)。文档包含三个层面的方案对比：
-- **架构方案一：IME 注入**（不推荐 — 层错配，终端不适合文本框模式）
-- **架构方案二：AccessibilityService 注入**（推荐 — Voice/Key Daemon + AccessibilityService）
-- **架构方案三：渐进上手路径**（最实用 — Phase 0 零开发 → Phase 1 轻量 Daemon → Phase 2 完整注入）
-- **物理推荐：8BitDo Micro**（¥180，6键+方向键，蓝牙 HID，独立走系统输入层）
-- **上手路线：Phase 0（8BitDo + Gboard）→ Phase 1（轻量 Voice Daemon）→ Phase 2（完整注入）**
-```
+**两大场景，两条路径：**
 
-**为何这样设计：** 终端操作本质上是精确交互（路径补全、参数调整、Ctrl 组合），语音不适合。中英文混说时语音识别最大的坑不是单条不准，而是**切换瞬间的模式漂移**——"/var/log"在中文模式下变成"瓦尔洛格"，"帮我查一下"在英文模式下变成"帮 my 茶 一下"。物理键硬切换是唯一的靠谱解法。
+| 场景 | 适合方式 | 文档 |
+|------|---------|------|
+| **SSH + tmux 远程终端**（本项目的核心场景） | 云端 `tmux send-keys` 注入，Beam Pro 只负责按键+麦克风 | [📄 docs/06](docs/06-voice-interaction-execution.md) |
+| **非 tmux 通用 App 输入**（浏览器地址栏、聊天 App 等） | Beam Pro 端 IME / AccessibilityService 注入 | [⌨️ docs/03](docs/03-input.md) |
+
+两者在同一个 Beam Pro 端 Voice/Key Daemon 进程里共存 — 按键事件捕获、PTT 录音、ASR 三个组件复用，输出去向按当前 App 路由。
+
+**物理推荐：** [8BitDo Micro](docs/03-input.md#硬件方案一8bitdo-micro--推荐物理按键)（¥180，6键+方向键，蓝牙 HID，独立走系统输入层）
+
+**上手路线：** [Phase 0（8BitDo + Gboard）→ Phase 1（轻量 Voice Daemon）→ Phase 2（完整注入）](docs/03-input.md#方案三渐进上手路径最实用）
 
 ---
 
